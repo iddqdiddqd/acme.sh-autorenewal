@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+set -x
+
+CURRENT_DATE=$(date +%Y-%m-%d-%H-%M)
+
+MONITOR_URL='changeme'
+DOMAIN_NAME='changeme'
+EC_CURVE='secp384r1'
+
+CERT_USER='changeme'
+CERT_PATH="/home/${CERT_USER}/${DOMAIN_NAME}.crt"
+KEY_PATH="/home/${CERT_USER}/${DOMAIN_NAME}.key"
+
+BACKUP_DIR="/home/${CERT_USER}/backup_certificates"
+BACKUP_CERT="${BACKUP_DIR}/${CURRENT_DATE}_${DOMAIN_NAME}.crt"
+BACKUP_KEY="${BACKUP_DIR}/${CURRENT_DATE}_${DOMAIN_NAME}.key"
+
+LOG_FILE="/home/${CERT_USER}/ssl_cron.log"
+RUN_LOG="/home/${CERT_USER}/ssl_cron_run_${CURRENT_DATE}.log"
+
+_update_cert() {(
+    set -e
+
+    /usr/bin/openssl ecparam \
+        -genkey \
+        -name ${EC_CURVE} | /usr/bin/openssl ec \
+        -out ${KEY_PATH}
+
+    /usr/bin/openssl req \
+        -new \
+        -key ${KEY_PATH} \
+        -out /home/${CERT_USER}/${DOMAIN_NAME}.csr \
+        -subj "/C=US/ST=NY/L=NY/O=NA/OU=NA/CN=${DOMAIN_NAME}"
+
+    bash /home/${CERT_USER}/.acme.sh/acme.sh \
+        --sign-csr \
+        --dns dns_cf \
+        --dnssleep 30 \
+        --csr /home/${CERT_USER}/${DOMAIN_NAME}.csr \
+        --force \
+        --server letsencrypt
+
+    cp "${HOME}/.acme.sh/${DOMAIN_NAME}_ecc/fullchain.cer" "${CERT_PATH}"
+
+    systemctl restart nginx
+
+    set +e
+)}
+
+_backup_cert() {
+    [[ ! -d "${BACKUP_DIR}" ]] && mkdir "${BACKUP_DIR}"
+    [[ -f "${CERT_PATH}" ]] && cp "${CERT_PATH}" "${BACKUP_CERT}"
+    [[ -f "${KEY_PATH}" ]] && cp "${KEY_PATH}" "${BACKUP_KEY}"
+}
+
+_report() {
+    [[ ! -f "${LOG_FILE}" ]] && touch "${LOG_FILE}"
+    echo "Executed on $(date +"%D@%H:%M:%S")" | tee -a "${LOG_FILE}"
+
+    if [[ "${rc}" -ne 0 ]]; then
+        echo -e "\tError occurred during cert renewal process.\n\tCheck the execution logs: ${RUN_LOG}" | tee -a "${LOG_FILE}"
+        if [[ "${NGINX_STATUS}" -ne 0 ]]; then
+            echo -e "\tNginx is dead. You definitely need to check the logs." | tee -a "${LOG_FILE}"
+        else
+            echo -e "\tBackup key/cert restored. Nginx is alive." | tee -a "${LOG_FILE}"
+        fi
+    else
+        echo -e "\tCert updated successfully." | tee -a "${LOG_FILE}"
+    fi
+}
+
+_main() {
+    _backup_cert
+    _update_cert
+    rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+        curl "${MONITOR_URL}/?state=complete"
+    else
+        curl "${MONITOR_URL}/?state=fail"
+        cp "${BACKUP_CERT}" "${CERT_PATH}"
+        cp "${BACKUP_KEY}" "${KEY_PATH}"
+        systemctl restart nginx
+        NGINX_STATUS=$?
+    fi
+    _report
+}
+
+[[ ! -f "${RUN_LOG}" ]] && touch "${RUN_LOG}"
+_main &> "${RUN_LOG}"
