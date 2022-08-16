@@ -1,3 +1,5 @@
+[![Shellcheck](https://github.com/iddqdiddqd/acme.sh-autorenewal-cron/actions/workflows/shellcheck.yml/badge.svg?branch=main)](https://github.com/iddqdiddqd/acme.sh-autorenewal-cron/actions/workflows/shellcheck.yml)
+
 # Cron for SSL/TLS certificate renewal via [acme.sh](https://github.com/acmesh-official/acme.sh)
 
 This shell scipt is intended for usage in `/etc/cron.monthly` or `/etc/cron.weekly` scenarios.
