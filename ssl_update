@@ -1,90 +1,222 @@
 #!/usr/bin/env bash
+#
+# Cron job for manual TLS certificate renewal via acme.sh.
 
 set -x
 
-CURRENT_DATE=$(date +%Y-%m-%d-%H-%M)
-
-MONITOR_URL='changeme'
-DOMAIN_NAME='changeme'
+# Various variables
+COMMON_NAME='changeme'
+CURRENT_DATE="$(date +%Y-%m-%d-%H-%M)"
 EC_CURVE='secp384r1'
+MONITORING_URL='changeme'
 
-CERT_USER='changeme'
-CERT_PATH="/home/${CERT_USER}/${DOMAIN_NAME}.crt"
-KEY_PATH="/home/${CERT_USER}/${DOMAIN_NAME}.key"
+# acme.sh-related variables
+ACMESH_DIR='/etc/acme.sh'
+ACMESH_EXECUTABLE="${ACMESH_DIR}/acme.sh"
 
-BACKUP_DIR="/home/${CERT_USER}/backup_certificates"
-BACKUP_CERT="${BACKUP_DIR}/${CURRENT_DATE}_${DOMAIN_NAME}.crt"
-BACKUP_KEY="${BACKUP_DIR}/${CURRENT_DATE}_${DOMAIN_NAME}.key"
+# Local directories involved in certificate renewal
+MAIN_DIR='/etc/ssl/ssl-renewal-cron'
+BACKUP_DIR="${MAIN_DIR}/backups"
+CERT_FILES_DIR="${MAIN_DIR}/certs"
+CSR_FILES_DIR="${MAIN_DIR}/csr"
+KEY_FILES_DIR="${MAIN_DIR}/private"
+LOG_DIR='/var/log/ssl-renewal-cron'
 
-LOG_FILE="/home/${CERT_USER}/ssl_cron.log"
-RUN_LOG="/home/${CERT_USER}/ssl_cron_run_${CURRENT_DATE}.log"
+# Local files involved in certificate renewal
+BACKUP_CERT_PATH="${BACKUP_DIR}/${CURRENT_DATE}_${COMMON_NAME}.crt"
+BACKUP_KEY_PATH="${BACKUP_DIR}/${CURRENT_DATE}_${COMMON_NAME}.key"
+CERT_PATH="${CERT_FILES_DIR}/${COMMON_NAME}.crt"
+CSR_PATH="${CSR_FILES_DIR}/${CURRENT_DATE}_${COMMON_NAME}.csr"
+KEY_PATH="${KEY_FILES_DIR}/${COMMON_NAME}.key"
 
-_update_cert() {(
-    set -e
+# Log files
+COMMON_LOG_FILE="${LOG_DIR}/common.log"
+EXECUTION_LOG_FILE="${LOG_DIR}/ssl-cron-execution_${CURRENT_DATE}.log"
 
-    /usr/bin/openssl ecparam \
-        -genkey \
-        -name ${EC_CURVE} | /usr/bin/openssl ec \
-        -out ${KEY_PATH}
+#######################################
+# Check the directories & files used by the script. Create nonexistent ones.
+# Globals:
+#   MAIN_DIR
+#   BACKUP_DIR
+#   CSR_FILES_DIR
+#   CERT_FILES_DIR
+#   KEY_FILES_DIR
+#   LOG_DIR
+#   COMMON_LOG_FILE
+# Arguments:
+#   None
+# Outputs:
+#   None
+# Returns:
+#   0 upon successful tests, non-zero on error.
+#######################################
+check_fs() {
+  [[ ! -d "${MAIN_DIR}" ]] && mkdir "${MAIN_DIR}"
+  [[ ! -d "${BACKUP_DIR}" ]] && mkdir "${BACKUP_DIR}"
+  [[ ! -d "${CSR_FILES_DIR}" ]] && mkdir "${CSR_FILES_DIR}"
+  [[ ! -d "${CERT_FILES_DIR}" ]] && mkdir "${CERT_FILES_DIR}"
+  [[ ! -d "${KEY_FILES_DIR}" ]] && mkdir "${KEY_FILES_DIR}"
+  [[ ! -d "${LOG_DIR}" ]] && mkdir "${LOG_DIR}"
+  [[ ! -f "${COMMON_LOG_FILE}" ]] && touch "${COMMON_LOG_FILE}"
+}
 
-    /usr/bin/openssl req \
-        -new \
-        -key ${KEY_PATH} \
-        -out /home/${CERT_USER}/${DOMAIN_NAME}.csr \
-        -subj "/C=US/ST=NY/L=NY/O=NA/OU=NA/CN=${DOMAIN_NAME}"
+#######################################
+# Backup public & private key pair.
+# Globals:
+#   BACKUP_DIR
+#   CERT_PATH
+#   BACKUP_CERT_PATH
+#   KEY_PATH
+#   BACKUP_KEY_PATH
+# Arguments:
+#   None
+# Outputs:
+#   None
+# Returns:
+#   0 if the key pair was backed up, non-zero on error.
+#######################################
+backup_cert() {
+  [[ ! -d "${BACKUP_DIR}" ]] && mkdir "${BACKUP_DIR}"
+  [[ -f "${CERT_PATH}" ]] && cp "${CERT_PATH}" "${BACKUP_CERT_PATH}"
+  [[ -f "${KEY_PATH}" ]] && cp "${KEY_PATH}" "${BACKUP_KEY_PATH}"
+}
 
-    bash /home/${CERT_USER}/.acme.sh/acme.sh \
-        --sign-csr \
-        --dns dns_cf \
-        --dnssleep 30 \
-        --csr /home/${CERT_USER}/${DOMAIN_NAME}.csr \
-        --force \
-        --server letsencrypt
+#######################################
+# Generate a new ECC public & private key pair.
+# Globals:
+#   EC_CURVE
+#   KEY_PATH
+#   CSR_PATH
+#   COMMON_NAME
+# Arguments:
+#   None
+# Outputs:
+#   Regular OpenSSL STDOUT
+# Returns:
+#   0 if the key pair was generated, non-zero on error.
+#######################################
+generate_new_key() {
+  /usr/bin/openssl ecparam \
+    -genkey \
+    -name "${EC_CURVE}" | /usr/bin/openssl ec \
+    -out "${KEY_PATH}"
 
-    cp "${HOME}/.acme.sh/${DOMAIN_NAME}_ecc/fullchain.cer" "${CERT_PATH}"
+  /usr/bin/openssl req \
+    -new \
+    -key "${KEY_PATH}" \
+    -out "${CSR_PATH}" \
+    -subj "/C=US/ST=NY/L=NY/O=NA/OU=NA/CN=${COMMON_NAME}"
+}
 
-    systemctl restart nginx
+#######################################
+# Sign the CSR, issue a new certificate, and reload Nginx.
+# Globals:
+#   ACMESH_EXECUTABLE
+#   CSR_PATH
+#   CERT_PATH
+# Arguments:
+#   None
+# Outputs:
+#   acme.sh STDOUT stream with log level '1'.
+# Returns:
+#   0 if the certificate was issued & Nginx restarted, non-zero on error.
+#######################################
+sign_csr() {
+  bash "${ACMESH_EXECUTABLE}" \
+    --sign-csr \
+    --dns dns_cf \
+    --dnssleep 30 \
+    --csr "${CSR_PATH}" \
+    --force \
+    --server letsencrypt \
+    --fullchain-file "${CERT_PATH}" \
+    --reloadcmd "systemctl restart nginx"
+}
 
+#######################################
+# Restore the latest key pair from backup.
+# Globals:
+#   BACKUP_CERT_PATH
+#   CERT_PATH
+#   BACKUP_KEY_PATH
+#   KEY_PATH
+#   NGINX_RESTORE_STATUS
+# Arguments:
+#   None
+# Outputs:
+#   Stream STDOUT & STDERR into cron execution log file.
+# Returns:
+#   Always 0 for logging purpose within the 'report_logs' function.
+#######################################
+restore_cert() {
+  cp "${BACKUP_CERT_PATH}" "${CERT_PATH}"
+  cp "${BACKUP_KEY_PATH}" "${KEY_PATH}"
+  systemctl restart nginx
+  NGINX_RESTORE_STATUS=$?
+}
+
+#######################################
+# Write report of the cron execution status.
+# Globals:
+#   COMMON_LOG_FILE
+#   EXECUTION_LOG_FILE
+#   NGINX_RESTORE_STATUS
+# Arguments:
+#   None
+# Outputs:
+#   Writes STDOUT into $COMMON_LOG_FILE.
+# Returns:
+#   0 if the logs were written, non-zero on error.
+#######################################
+report_logs() {
+  echo "Executed on $(date +"%D@%H:%M:%S")" | tee -a "${COMMON_LOG_FILE}"
+  if [[ "${RC}" -ne 0 ]]; then
+    echo -e "\tError occurred during renewal certificate signing." \
+      | tee -a "${COMMON_LOG_FILE}"
+    if [[ "${NGINX_RESTORE_STATUS}" -ne 0 ]]; then
+      echo -e "\tNginx is dead. You definitely need to check the logs." \
+        | tee -a "${COMMON_LOG_FILE}"
+    else
+      echo -e "\tBackup key pair restored. Nginx is running." \
+        | tee -a "${COMMON_LOG_FILE}"
+    fi
+  else 
+    echo -e "\tCertificate was updated successfully." \
+      | tee -a "${COMMON_LOG_FILE}"
+  fi
+  echo -e "\tExecution log: ${EXECUTION_LOG_FILE}" \
+    | tee -a "${COMMON_LOG_FILE}"
+}
+
+#######################################
+# Main function within the script.
+# Globals:
+#   MONITORING_URL
+# Arguments:
+#   None
+# Outputs:
+#   Streams STDOUT & STDERR into $EXECUTION_LOG_FILE.
+# Returns:
+#   0 if the key pair was renewed along with Nginx successfull restart,
+#   non-zero on error.
+#######################################
+main() {
+  backup_cert
+  generate_new_key
+  set +e
+  sign_csr
+  RC=$?
+  set -e
+  if [[ "${RC}" -eq 0 ]]; then
+    curl "${MONITORING_URL}/?state=complete"
+  else
+    curl "${MONITORING_URL}/?state=fail"
     set +e
-)}
-
-_backup_cert() {
-    [[ ! -d "${BACKUP_DIR}" ]] && mkdir "${BACKUP_DIR}"
-    [[ -f "${CERT_PATH}" ]] && cp "${CERT_PATH}" "${BACKUP_CERT}"
-    [[ -f "${KEY_PATH}" ]] && cp "${KEY_PATH}" "${BACKUP_KEY}"
+    restore_cert
+    set -e
+  fi
+  report_logs
 }
 
-_report() {
-    [[ ! -f "${LOG_FILE}" ]] && touch "${LOG_FILE}"
-    echo "Executed on $(date +"%D@%H:%M:%S")" | tee -a "${LOG_FILE}"
-
-    if [[ "${rc}" -ne 0 ]]; then
-        echo -e "\tError occurred during cert renewal process.\n\tCheck the execution logs: ${RUN_LOG}" | tee -a "${LOG_FILE}"
-        if [[ "${NGINX_STATUS}" -ne 0 ]]; then
-            echo -e "\tNginx is dead. You definitely need to check the logs." | tee -a "${LOG_FILE}"
-        else
-            echo -e "\tBackup key/cert restored. Nginx is alive." | tee -a "${LOG_FILE}"
-        fi
-    else
-        echo -e "\tCert updated successfully." | tee -a "${LOG_FILE}"
-    fi
-}
-
-_main() {
-    _backup_cert
-    _update_cert
-    rc=$?
-    if [[ "${rc}" -eq 0 ]]; then
-        curl "${MONITOR_URL}/?state=complete"
-    else
-        curl "${MONITOR_URL}/?state=fail"
-        cp "${BACKUP_CERT}" "${CERT_PATH}"
-        cp "${BACKUP_KEY}" "${KEY_PATH}"
-        systemctl restart nginx
-        NGINX_STATUS=$?
-    fi
-    _report
-}
-
-[[ ! -f "${RUN_LOG}" ]] && touch "${RUN_LOG}"
-_main &> "${RUN_LOG}"
+check_fs
+main &> "${EXECUTION_LOG_FILE}"
